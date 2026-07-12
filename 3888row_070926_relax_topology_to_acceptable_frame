@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""Relax a predicted crosslink topology into a plausible final hydrogel frame.
+
+This script is intentionally closer to the original simulation than the earlier
+spring-only relaxer. The simulation does not have a standalone "relax this fixed
+topology" function; it moves molecules/clusters and forms bonds when domains
+touch. The closest reusable idea is the cluster-gluing logic in
+gel_network.force_glue_all_clusters:
+
+1. Start from the initial molecule/domain coordinates.
+2. Read a predicted topology as domain-domain edges.
+3. Process high-confidence edges first.
+4. When an edge connects two separate molecule clusters, move the smaller
+   cluster rigidly until the two requested domains sit at the target bond
+   length.
+5. Commit the bond in the same row+1 connection-matrix encoding used by the
+   simulation.
+
+That means this is not a pure ML coordinate regressor. It is a hybrid:
+GNN/tree model predicts the topology, then simulation-style geometry rules turn
+that topology into a physically plausible frame.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Turn predicted final crosslinks into a simulation-style relaxed frame."
+    )
+    parser.add_argument("--state-file", default=None, help="NPZ state file containing after_placement_xyz.")
+    parser.add_argument("--initial-coordinates", default=None, help="SimCode txt coordinates from gel_coordinates_placed*.txt.")
+    parser.add_argument("--edge-csv", required=True, help="CSV with domain_a/domain_b predicted edges.")
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--nd", type=int, default=None, help="Domains per molecule. Required for txt input.")
+    parser.add_argument("--max-coordination", type=int, default=None, help="Connection slots per domain.")
+    parser.add_argument("--box-size-nm", type=float, default=None)
+    parser.add_argument("--particle-radius-nm", type=float, default=None)
+    parser.add_argument("--target-bond-length-nm", type=float, default=None)
+    parser.add_argument(
+        "--target-length-source",
+        choices=["provided", "constant", "radius"],
+        default="provided",
+        help="Compatibility with older wrapper scripts. 'provided' uses predicted_bond_length_nm when present.",
+    )
+    parser.add_argument("--probability-column", default="predicted_probability")
+    parser.add_argument("--max-edges", type=int, default=None, help="Optional cap after sorting by probability.")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--render-mode", default="crosslinked_domains")
+    parser.add_argument("--render-style", default="simulation")
+    parser.add_argument("--render-backend", default="none")
+
+    # Accepted for compatibility with old spring-relax commands. They are not
+    # used by the cluster-glue relaxer, but accepting them prevents wrapper
+    # scripts from failing while you transition workflows.
+    parser.add_argument("--iterations", type=int, default=0)
+    parser.add_argument("--learning-rate", type=float, default=0.0)
+    parser.add_argument("--spring-weight", type=float, default=0.0)
+    parser.add_argument("--backbone-weight", type=float, default=0.0)
+    parser.add_argument("--backbone-length-source", default="initial")
+    parser.add_argument("--anchor-weight", type=float, default=0.0)
+    parser.add_argument("--network-compact-weight", type=float, default=0.0)
+    parser.add_argument("--network-target-radius-fraction", type=float, default=0.0)
+    parser.add_argument("--repulsion-weight", type=float, default=0.0)
+    return parser.parse_args()
+
+
+class UnionFind:
+    def __init__(self, n: int):
+        self.parent = np.arange(n, dtype=np.int64)
+        self.size = np.ones(n, dtype=np.int64)
+
+    def find(self, x: int) -> int:
+        root = x
+        while self.parent[root] != root:
+            root = int(self.parent[root])
+        while self.parent[x] != x:
+            nxt = int(self.parent[x])
+            self.parent[x] = root
+            x = nxt
+        return root
+
+    def union(self, a: int, b: int) -> int:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return ra
+        if self.size[ra] < self.size[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        self.size[ra] += self.size[rb]
+        return ra
+
+    def members(self, root: int) -> np.ndarray:
+        root = self.find(root)
+        return np.array([i for i in range(len(self.parent)) if self.find(i) == root], dtype=np.int64)
+
+
+def main() -> None:
+    args = parse_args()
+    rng = np.random.default_rng(args.seed)
+    output_root = Path(args.output_root).expanduser().resolve()
+    frames_dir = output_root / "Frames"
+    analysis_dir = output_root / "Analysis"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    initial_xyz, metadata = load_initial_xyz(args)
+    nd = int(args.nd or metadata["nd"])
+    n_domains = len(initial_xyz)
+    if n_domains % nd != 0:
+        raise ValueError(f"n_domains={n_domains} is not divisible by nd={nd}")
+    nm = n_domains // nd
+
+    particle_radius = float(args.particle_radius_nm or metadata.get("particle_radius_nm", 2.0))
+    box_size = float(args.box_size_nm or metadata.get("box_size_nm", 150.0))
+    max_coordination = int(args.max_coordination or metadata.get("max_coordination", infer_max_coordination(args.edge_csv)))
+    fallback_length = float(args.target_bond_length_nm or (2.0 * particle_radius))
+
+    edge_frame = read_edge_frame(args.edge_csv, args.probability_column, args.max_edges)
+    relaxed_xyz, conn, used_edges, history = simulation_cluster_glue_relax(
+        initial_xyz=initial_xyz,
+        edge_frame=edge_frame,
+        nd=nd,
+        nm=nm,
+        max_coordination=max_coordination,
+        box_size=box_size,
+        fallback_bond_length=fallback_length,
+        target_length_source=args.target_length_source,
+        rng=rng,
+    )
+
+    final_edges = connection_edges(conn)
+    validation = validate_frame(relaxed_xyz, final_edges, nd, nm, max_coordination, box_size)
+    validation.update(
+        {
+            "script_version": "simulation_cluster_glue_relax_v1",
+            "source_state_file": str(args.state_file or args.initial_coordinates),
+            "edge_csv": str(args.edge_csv),
+            "n_candidate_edges_in_csv": int(len(edge_frame)),
+            "n_edges_requested": int(len(edge_frame)),
+            "n_edges_used": int(len(used_edges)),
+            "target_length_source": args.target_length_source,
+            "fallback_bond_length_nm": fallback_length,
+            "particle_radius_nm": particle_radius,
+            "box_size_nm": box_size,
+            "nd": nd,
+            "nm": nm,
+            "max_coordination": max_coordination,
+        }
+    )
+
+    npz_path = frames_dir / "relaxed_acceptable_final_frame.npz"
+    np.savez_compressed(
+        npz_path,
+        initial_xyz=np.asarray(initial_xyz, dtype=np.float32),
+        relaxed_final_xyz=np.asarray(relaxed_xyz, dtype=np.float32),
+        xyz=np.asarray(relaxed_xyz, dtype=np.float32),
+        conn=np.asarray(conn, dtype=np.int32),
+        final_edges=np.asarray(final_edges, dtype=np.int64),
+        used_predicted_edges=np.asarray(used_edges, dtype=np.int64),
+        box_size_nm=np.asarray(box_size, dtype=np.float32),
+        particle_radius_nm=np.asarray(particle_radius, dtype=np.float32),
+        nd=np.asarray(nd, dtype=np.int32),
+        max_coordination=np.asarray(max_coordination, dtype=np.int32),
+    )
+
+    coords_txt = frames_dir / "gel_coordinates_relaxed_acceptable_final_frame.txt"
+    conn_txt = frames_dir / "ConnectionMatrix_relaxed_acceptable_final_frame.txt"
+    np.savetxt(coords_txt, relaxed_xyz, header="x(nm) y(nm) z(nm)", comments="", fmt="%.6f")
+    np.savetxt(conn_txt, conn, header="Connection Matrix (encoded partner row+1; 0=empty)", comments="", fmt="%d")
+
+    history_path = analysis_dir / "relaxed_acceptable_final_frame_history.csv"
+    pd.DataFrame(history).to_csv(history_path, index=False)
+    summary_path = analysis_dir / "relaxed_acceptable_final_frame_summary.json"
+    validation["npz_path"] = str(npz_path)
+    validation["coordinates_txt"] = str(coords_txt)
+    validation["connections_txt"] = str(conn_txt)
+    validation["history_csv"] = str(history_path)
+    summary_path.write_text(json.dumps(validation, indent=2))
+
+    print(json.dumps(validation, indent=2))
+
+
+def load_initial_xyz(args: argparse.Namespace) -> tuple[np.ndarray, dict]:
+    if args.initial_coordinates:
+        xyz = np.loadtxt(Path(args.initial_coordinates), skiprows=1).astype(np.float32)
+        if args.nd is None:
+            raise ValueError("--nd is required when using --initial-coordinates")
+        return xyz, {"nd": int(args.nd)}
+
+    if not args.state_file:
+        raise ValueError("Provide either --state-file or --initial-coordinates")
+
+    state = Path(args.state_file).expanduser()
+    with np.load(state, allow_pickle=True) as z:
+        keys = set(z.files)
+        for key in ("after_placement_xyz", "initial_xyz", "xyz", "coordinates"):
+            if key in keys:
+                xyz = np.asarray(z[key], dtype=np.float32)
+                break
+        else:
+            raise KeyError(f"No initial coordinate key found in {state}; keys={sorted(keys)}")
+
+        metadata = {
+            "nd": int(z["no_domains"]) if "no_domains" in keys else infer_nd_from_filename(state),
+            "box_size_nm": float(z["box_size_nm"]) if "box_size_nm" in keys else infer_float_from_filename(state, "box", 150.0),
+            "particle_radius_nm": float(z["particle_radius_nm"]) if "particle_radius_nm" in keys else infer_float_from_filename(state, "radius", 2.0),
+            "max_coordination": int(z["max_coordination"]) if "max_coordination" in keys else int(infer_float_from_filename(state, "coord", 2.0)),
+        }
+    return xyz, metadata
+
+
+def infer_float_from_filename(path: Path, label: str, default: float) -> float:
+    match = re.search(rf"{label}_([0-9]+(?:\.[0-9]+)?)", path.name)
+    return float(match.group(1)) if match else default
+
+
+def infer_nd_from_filename(path: Path) -> int:
+    return int(infer_float_from_filename(path, "domains", 4.0))
+
+
+def infer_max_coordination(edge_csv: str) -> int:
+    frame = pd.read_csv(edge_csv)
+    if frame.empty:
+        return 1
+    degree = pd.concat([frame["domain_a"], frame["domain_b"]]).value_counts()
+    return int(max(1, degree.max()))
+
+
+def read_edge_frame(edge_csv: str, probability_column: str, max_edges: int | None) -> pd.DataFrame:
+    frame = pd.read_csv(edge_csv)
+    required = {"domain_a", "domain_b"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"{edge_csv} missing required columns: {sorted(missing)}")
+    if probability_column in frame.columns:
+        frame = frame.sort_values(probability_column, ascending=False)
+    frame = frame.drop_duplicates(subset=["domain_a", "domain_b"])
+    if max_edges is not None:
+        frame = frame.head(int(max_edges))
+    return frame.reset_index(drop=True)
+
+
+def simulation_cluster_glue_relax(
+    initial_xyz: np.ndarray,
+    edge_frame: pd.DataFrame,
+    nd: int,
+    nm: int,
+    max_coordination: int,
+    box_size: float,
+    fallback_bond_length: float,
+    target_length_source: str,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, list[tuple[int, int]], list[dict]]:
+    xyz = np.asarray(initial_xyz, dtype=np.float32).copy()
+    xyz = np.clip(xyz, 0.0, box_size)
+    conn = np.zeros((len(xyz), max_coordination), dtype=np.int32)
+    fill = np.zeros(len(xyz), dtype=np.int16)
+    uf = UnionFind(nm)
+    used_edges: list[tuple[int, int]] = []
+    history: list[dict] = []
+
+    for rank, row in edge_frame.iterrows():
+        a = int(row["domain_a"])
+        b = int(row["domain_b"])
+        if not (0 <= a < len(xyz) and 0 <= b < len(xyz)) or a == b:
+            continue
+        mol_a, mol_b = a // nd, b // nd
+        if mol_a == mol_b:
+            continue
+        if fill[a] >= max_coordination or fill[b] >= max_coordination:
+            continue
+
+        target = bond_length_for_row(row, fallback_bond_length, target_length_source)
+        root_a, root_b = uf.find(mol_a), uf.find(mol_b)
+        moved_molecules = 0
+
+        if root_a != root_b:
+            if uf.size[root_a] <= uf.size[root_b]:
+                mover_root = root_a
+                mover_domain = a
+                anchor_domain = b
+            else:
+                mover_root = root_b
+                mover_domain = b
+                anchor_domain = a
+
+            mover_mols = uf.members(mover_root)
+            move_cluster_to_bond(
+                xyz=xyz,
+                mover_mols=mover_mols,
+                mover_domain=mover_domain,
+                anchor_domain=anchor_domain,
+                nd=nd,
+                target_length=target,
+                box_size=box_size,
+                rng=rng,
+            )
+            moved_molecules = int(len(mover_mols))
+
+        conn[a, fill[a]] = b + 1
+        conn[b, fill[b]] = a + 1
+        fill[a] += 1
+        fill[b] += 1
+        uf.union(mol_a, mol_b)
+        used_edges.append((a, b))
+        actual = float(np.linalg.norm(xyz[a] - xyz[b]))
+        history.append(
+            {
+                "rank": int(rank),
+                "domain_a": a,
+                "domain_b": b,
+                "mol_a": int(mol_a),
+                "mol_b": int(mol_b),
+                "target_bond_length_nm": float(target),
+                "actual_bond_length_nm": actual,
+                "moved_molecules": moved_molecules,
+                "n_used_edges": len(used_edges),
+            }
+        )
+
+    return xyz, conn, used_edges, history
+
+
+def bond_length_for_row(row: pd.Series, fallback: float, source: str) -> float:
+    if source == "provided":
+        for key in ("predicted_bond_length_nm", "gnn_predicted_bond_length_nm", "target_bond_length_nm"):
+            if key in row and pd.notna(row[key]):
+                value = float(row[key])
+                if np.isfinite(value) and value > 0:
+                    return value
+    return float(fallback)
+
+
+def move_cluster_to_bond(
+    xyz: np.ndarray,
+    mover_mols: np.ndarray,
+    mover_domain: int,
+    anchor_domain: int,
+    nd: int,
+    target_length: float,
+    box_size: float,
+    rng: np.random.Generator,
+) -> None:
+    diff = xyz[mover_domain] - xyz[anchor_domain]
+    dist = float(np.linalg.norm(diff))
+    if dist < 1e-8:
+        diff = rng.normal(size=3).astype(np.float32)
+        dist = float(np.linalg.norm(diff))
+    unit = diff / max(dist, 1e-8)
+    desired_mover_position = xyz[anchor_domain] + unit * target_length
+    shift = desired_mover_position - xyz[mover_domain]
+    rows = molecule_rows(mover_mols, nd)
+    xyz[rows] += shift.astype(np.float32)
+    keep_rows_inside_box(xyz, rows, box_size)
+
+
+def molecule_rows(molecules: np.ndarray, nd: int) -> np.ndarray:
+    return np.concatenate([np.arange(int(m) * nd, int(m) * nd + nd) for m in molecules]).astype(np.int64)
+
+
+def keep_rows_inside_box(xyz: np.ndarray, rows: np.ndarray, box_size: float) -> None:
+    pts = xyz[rows]
+    shift = np.zeros(3, dtype=np.float32)
+    mins = pts.min(axis=0)
+    maxs = pts.max(axis=0)
+    for dim in range(3):
+        if mins[dim] < 0.0:
+            shift[dim] += -mins[dim]
+        if maxs[dim] + shift[dim] > box_size:
+            shift[dim] += box_size - (maxs[dim] + shift[dim])
+    xyz[rows] += shift
+    xyz[rows] = np.clip(xyz[rows], 0.0, box_size)
+
+
+def connection_edges(conn: np.ndarray) -> list[tuple[int, int]]:
+    edges = set()
+    for a in range(conn.shape[0]):
+        for partner in conn[a]:
+            b = int(partner) - 1
+            if b >= 0:
+                edges.add(tuple(sorted((a, b))))
+    return sorted(edges)
+
+
+def validate_frame(
+    xyz: np.ndarray,
+    edges: list[tuple[int, int]],
+    nd: int,
+    nm: int,
+    max_coordination: int,
+    box_size: float,
+) -> dict:
+    degrees = np.zeros(len(xyz), dtype=np.int32)
+    uf = UnionFind(nm)
+    lengths = []
+    for a, b in edges:
+        degrees[a] += 1
+        degrees[b] += 1
+        uf.union(a // nd, b // nd)
+        lengths.append(float(np.linalg.norm(xyz[a] - xyz[b])))
+    cluster_sizes: dict[int, int] = {}
+    for mol in range(nm):
+        root = uf.find(mol)
+        cluster_sizes[root] = cluster_sizes.get(root, 0) + 1
+    largest = max(cluster_sizes.values()) if cluster_sizes else 0
+    lengths_arr = np.asarray(lengths, dtype=np.float32)
+    in_box = bool(np.all(xyz >= -1e-5) and np.all(xyz <= box_size + 1e-5))
+    return {
+        "accepted": bool(in_box and degrees.max(initial=0) <= max_coordination),
+        "n_domains": int(len(xyz)),
+        "n_molecules": int(nm),
+        "n_edges": int(len(edges)),
+        "max_degree": int(degrees.max(initial=0)),
+        "mean_degree": float(degrees.mean()) if len(degrees) else 0.0,
+        "unused_domain_fraction": float(np.mean(degrees == 0)) if len(degrees) else 1.0,
+        "n_molecule_clusters": int(len(cluster_sizes)),
+        "largest_cluster_molecules": int(largest),
+        "largest_cluster_fraction": float(largest / max(nm, 1)),
+        "bond_length_mean_nm": float(np.mean(lengths_arr)) if len(lengths_arr) else None,
+        "bond_length_std_nm": float(np.std(lengths_arr)) if len(lengths_arr) else None,
+        "bond_length_min_nm": float(np.min(lengths_arr)) if len(lengths_arr) else None,
+        "bond_length_max_nm": float(np.max(lengths_arr)) if len(lengths_arr) else None,
+        "all_points_inside_box": in_box,
+    }
+
+
+if __name__ == "__main__":
+    main()
