@@ -7,7 +7,4 @@ Full 3D molecular simulations of hydrogel networks are slow, taking approximatel
 # Method
 Built a data pipeline to clean and structure output from hundreds of 3D molecular simulations. Represented molecular structure as graph data. Trained a graph neural network to predict structural properties directly from molecular geometry.
 
-# Files
-
-#
 
